@@ -1,0 +1,378 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>3D Sci-Fi Social Network Hive Plot</title>
+    <script src="https://unpkg.com/three@0.128.0/build/three.min.js"></script>
+    <script src="https://unpkg.com/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
+    <script src="https://unpkg.com/papaparse@latest/papaparse.min.js"></script>
+    <style>
+        body {
+            margin: 0;
+            overflow: hidden;
+            background: #0a0a1a;
+            font-family: Arial, sans-serif;
+        }
+        #info {
+            position: absolute;
+            top: 10px;
+            left: 10px;
+            color: #00ffcc;
+            background: rgba(0, 0, 20, 0.7);
+            padding: 10px;
+            font-size: 14px;
+            border: 1px solid #00ffcc;
+            border-radius: 4px;
+        }
+        #tooltip {
+            position: absolute;
+            color: #00ffcc;
+            background: rgba(0, 0, 20, 0.9);
+            padding: 5px;
+            border: 1px solid #00ffcc;
+            border-radius: 4px;
+            pointer-events: none;
+            display: none;
+        }
+    </style>
+</head>
+<body>
+    <div id="info">
+        <p>Orbit: Left-click + drag</p>
+        <p>Zoom: Scroll wheel</p>
+        <p>Pan: Right-click + drag</p>
+        <p>Pull node: Click + drag along axis</p>
+        <p>Hover: View metrics</p>
+    </div>
+    <div id="tooltip"></div>
+
+    <script>
+        async function loadAndDraw() {
+            try {
+                const [devResponse, edgeResponse] = await Promise.all([
+                    fetch('./developer_network_countrybetweenness.csv'),
+                    fetch('./network_edges.csv')
+                ]);
+
+                if (!devResponse.ok || !edgeResponse.ok) {
+                    throw new Error('Failed to fetch CSV files');
+                }
+
+                const [devText, edgeText] = await Promise.all([
+                    devResponse.text(),
+                    edgeResponse.text()
+                ]);
+
+                const developers = Papa.parse(devText, {
+                    header: true,
+                    dynamicTyping: true,
+                    skipEmptyLines: true
+                }).data.filter(d => d.developer_id);
+
+                const edges = Papa.parse(edgeText, {
+                    header: true,
+                    dynamicTyping: true,
+                    skipEmptyLines: true
+                }).data.filter(d => d.source && d.target);
+
+                if (!developers.length || !edges.length) {
+                    throw new Error('No valid data found in CSV files');
+                }
+
+                create3DHivePlot(developers, edges);
+            } catch (error) {
+                console.error('Error loading data:', error);
+                alert('Failed to load data. Check console and CSV files.');
+            }
+        }
+
+        function create3DHivePlot(developers, edges) {
+            const scene = new THREE.Scene();
+            const camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
+            const renderer = new THREE.WebGLRenderer({ antialias: true });
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            document.body.appendChild(renderer.domElement);
+
+            // Orbit controls
+            const controls = new THREE.OrbitControls(camera, renderer.domElement);
+            controls.enableDamping = true;
+            controls.dampingFactor = 0.05;
+
+            // Lighting
+            const ambientLight = new THREE.AmbientLight(0x4040ff, 0.2);
+            scene.add(ambientLight);
+            const pointLight = new THREE.PointLight(0x00ffcc, 1, 1000);
+            pointLight.position.set(0, 0, 300);
+            scene.add(pointLight);
+
+            // Define axes in 3D
+            const radius = 200;
+            const axes = [
+                { name: 'Betweenness', angle: 0, property: 'betweenness', color: 0x00ffcc, direction: new THREE.Vector3(1, 0, 0) },
+                { name: 'In-Degree', angle: 120, property: 'in_degree', color: 0xff00ff, direction: new THREE.Vector3(-0.5, Math.sqrt(3)/2, 0) },
+                { name: 'Out-Degree', angle: 240, property: 'out_degree', color: 0x00ff00, direction: new THREE.Vector3(-0.5, -Math.sqrt(3)/2, 0) }
+            ];
+
+            // Normalize data
+            developers = developers.map(dev => ({
+                ...dev,
+                betweenness: Number(dev.betweenness) || 0,
+                in_degree: Number(dev.in_degree) || 0,
+                out_degree: Number(dev.out_degree) || 0,
+                country: dev.country || 'Unknown'
+            }));
+
+            // Scales for positioning
+            const scales = {
+                betweenness: Math.max(...developers.map(d => d.betweenness)) || 1,
+                in_degree: Math.max(...developers.map(d => d.in_degree)) || 1,
+                out_degree: Math.max(...developers.map(d => d.out_degree)) || 1
+            };
+
+            // Draw axes
+            axes.forEach(axis => {
+                const angle = THREE.MathUtils.degToRad(axis.angle);
+                const x = Math.cos(angle) * radius;
+                const y = Math.sin(angle) * radius;
+                const geometry = new THREE.BufferGeometry().setFromPoints([
+                    new THREE.Vector3(0, 0, 0),
+                    new THREE.Vector3(x, y, 0)
+                ]);
+                const material = new THREE.LineBasicMaterial({ color: axis.color, linewidth: 2 });
+                const line = new THREE.Line(geometry, material);
+                scene.add(line);
+
+                const spriteMaterial = new THREE.SpriteMaterial({
+                    color: axis.color,
+                    map: createTextTexture(axis.name)
+                });
+                const sprite = new THREE.Sprite(spriteMaterial);
+                sprite.position.set(x * 1.1, y * 1.1, 0);
+                sprite.scale.set(50, 15, 1);
+                scene.add(sprite);
+            });
+
+            // Position nodes with flags
+            const nodePositions = new Map();
+            const nodeObjects = [];
+            const loader = new THREE.TextureLoader();
+            developers.forEach(dev => {
+                const countryCode = getCountryCode(dev.country);
+                const flagUrl = countryCode 
+                    ? `https://flagcdn.com/16x12/${countryCode.toLowerCase()}.png` 
+                    : 'https://flagcdn.com/16x12/un.png';
+
+                axes.forEach(axis => {
+                    const value = dev[axis.property];
+                    const distance = (value / scales[axis.property]) * radius;
+                    const angle = THREE.MathUtils.degToRad(axis.angle);
+                    const x = Math.cos(angle) * distance;
+                    const y = Math.sin(angle) * distance;
+                    const z = 0;
+
+                    if (!nodePositions.has(dev.developer_id)) {
+                        nodePositions.set(dev.developer_id, {});
+                    }
+                    nodePositions.get(dev.developer_id)[axis.property] = { x, y, z };
+
+                    const geometry = new THREE.SphereGeometry(5, 32, 32);
+                    const material = new THREE.MeshPhongMaterial({
+                        map: loader.load(flagUrl),
+                        transparent: true,
+                        emissive: axis.color,
+                        emissiveIntensity: 0.3,
+                        shininess: 100
+                    });
+                    const sphere = new THREE.Mesh(geometry, material);
+                    sphere.position.set(x, y, z);
+                    sphere.userData = { ...dev, axis: axis.property, axisDirection: axis.direction.clone() };
+                    scene.add(sphere);
+
+                    const spriteMaterial = new THREE.SpriteMaterial({
+                        color: axis.color,
+                        transparent: true,
+                        opacity: 0.5
+                    });
+                    const sprite = new THREE.Sprite(spriteMaterial);
+                    sprite.scale.set(15, 15, 1);
+                    sphere.add(sprite);
+
+                    nodeObjects.push(sphere);
+                });
+            });
+
+            // Draw edges (refined to Out-Degree -> In-Degree)
+            const edgeGeometry = new THREE.BufferGeometry();
+            const edgeMaterial = new THREE.LineBasicMaterial({
+                color: 0x00ccff,
+                transparent: true,
+                opacity: 0.3,
+                linewidth: 2
+            });
+            const positions = [];
+
+            edges.forEach(edge => {
+                const sourcePos = nodePositions.get(edge.source);
+                const targetPos = nodePositions.get(edge.target);
+                if (sourcePos && targetPos) {
+                    // Connect Out-Degree of source to In-Degree of target
+                    const s = sourcePos['out_degree'];
+                    const t = targetPos['in_degree'];
+                    positions.push(s.x, s.y, s.z);
+                    positions.push(t.x, t.y, t.z);
+                }
+            });
+
+            edgeGeometry.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+            const edgeLines = new THREE.LineSegments(edgeGeometry, edgeMaterial);
+            scene.add(edgeLines);
+
+            // Background stars
+            const starGeometry = new THREE.BufferGeometry();
+            const starMaterial = new THREE.PointsMaterial({ color: 0xaaaaaa, size: 1, transparent: true });
+            const starPositions = [];
+            for (let i = 0; i < 1000; i++) {
+                starPositions.push(Math.random() * 2000 - 1000);
+                starPositions.push(Math.random() * 2000 - 1000);
+                starPositions.push(Math.random() * 2000 - 1000);
+            }
+            starGeometry.setAttribute('position', new THREE.Float32BufferAttribute(starPositions, 3));
+            scene.add(new THREE.Points(starGeometry, starMaterial));
+
+            // Raycaster for interaction
+            const raycaster = new THREE.Raycaster();
+            const mouse = new THREE.Vector2();
+            const tooltip = document.getElementById('tooltip');
+            let draggedNode = null;
+
+            renderer.domElement.addEventListener('mousedown', onMouseDown);
+            renderer.domElement.addEventListener('mousemove', onMouseMove);
+            renderer.domElement.addEventListener('mouseup', onMouseUp);
+
+            function onMouseDown(event) {
+                event.preventDefault();
+                mouse.x = (event.clientX / window.innerWidth) * 2 - 1;
+                mouse.y = -(event.clientY / window.innerHeight) * 2 + 1;
+                raycaster.setFromCamera(mouse, camera);
+                const intersects = raycaster.intersectObjects(nodeObjects);
+                if (intersects.length > 0) {
+                    draggedNode = intersects[0].object;
+                    draggedNode.material.emissiveIntensity = 1.0;
+                    controls.enabled = false;
+                }
+            }
+
+            function onMouseMove(event) {
+                mouse.x = (event.clientX / window.innerWidth) * 2 - 1;
+                mouse.y = -(event.clientY / window.innerHeight) * 2 + 1;
+                raycaster.setFromCamera(mouse, camera);
+
+                if (draggedNode) {
+                    const plane = new THREE.Plane(new THREE.Vector3(0, 0, 1), 0);
+                    const intersect = raycaster.ray.intersectPlane(plane, new THREE.Vector3());
+                    if (intersect) {
+                        const axisDir = draggedNode.userData.axisDirection;
+                        const origin = new THREE.Vector3(0, 0, 0);
+                        const vector = intersect.clone().sub(origin);
+                        const projection = vector.dot(axisDir);
+                        const newPos = axisDir.clone().multiplyScalar(projection);
+                        draggedNode.position.copy(newPos);
+
+                        const devId = draggedNode.userData.developer_id;
+                        const axisProp = draggedNode.userData.axis;
+                        nodePositions.get(devId)[axisProp] = { x: newPos.x, y: newPos.y, z: newPos.z };
+                        updateEdges();
+                    }
+                } else {
+                    const intersects = raycaster.intersectObjects(nodeObjects);
+                    if (intersects.length > 0) {
+                        const node = intersects[0].object.userData;
+                        tooltip.style.display = 'block';
+                        tooltip.style.left = `${event.clientX + 10}px`;
+                        tooltip.style.top = `${event.clientY + 10}px`;
+                        tooltip.innerHTML = `
+                            ID: ${node.developer_id}<br>
+                            Country: ${node.country}<br>
+                            Betweenness: ${node.betweenness.toFixed(4)}<br>
+                            In-Degree: ${node.in_degree}<br>
+                            Out-Degree: ${node.out_degree}
+                        `;
+                    } else {
+                        tooltip.style.display = 'none';
+                    }
+                }
+            }
+
+            function onMouseUp() {
+                if (draggedNode) {
+                    draggedNode.material.emissiveIntensity = 0.3;
+                    draggedNode = null;
+                    controls.enabled = true;
+                }
+            }
+
+            function updateEdges() {
+                const newPositions = [];
+                edges.forEach(edge => {
+                    const sourcePos = nodePositions.get(edge.source);
+                    const targetPos = nodePositions.get(edge.target);
+                    if (sourcePos && targetPos) {
+                        const s = sourcePos['out_degree'];
+                        const t = targetPos['in_degree'];
+                        newPositions.push(s.x, s.y, s.z);
+                        newPositions.push(t.x, t.y, t.z);
+                    }
+                });
+                edgeGeometry.setAttribute('position', new THREE.Float32BufferAttribute(newPositions, 3));
+                edgeGeometry.attributes.position.needsUpdate = true;
+            }
+
+            camera.position.z = 300;
+
+            function animate() {
+                requestAnimationFrame(animate);
+                controls.update();
+                renderer.render(scene, camera);
+            }
+
+            animate();
+
+            window.addEventListener('resize', () => {
+                camera.aspect = window.innerWidth / window.innerHeight;
+                camera.updateProjectionMatrix();
+                renderer.setSize(window.innerWidth, window.innerHeight);
+            });
+
+            function createTextTexture(text) {
+                const canvas = document.createElement('canvas');
+                canvas.width = 256;
+                canvas.height = 64;
+                const ctx = canvas.getContext('2d');
+                ctx.fillStyle = 'rgba(0, 0, 0, 0)';
+                ctx.fillRect(0, 0, canvas.width, canvas.height);
+                ctx.fillStyle = '#00ffcc';
+                ctx.font = '30px Arial';
+                ctx.textAlign = 'center';
+                ctx.fillText(text, canvas.width / 2, canvas.height / 2);
+                return new THREE.CanvasTexture(canvas);
+            }
+
+            function getCountryCode(country) {
+                const countryCodes = {
+                    'United States': 'US',
+                    'United Kingdom': 'GB',
+                    'Germany': 'DE',
+                    'France': 'FR',
+                    'Japan': 'JP',
+                    'China': 'CN',
+                    'India': 'IN',
+                    'Unknown': 'UN'
+                };
+                return countryCodes[country] || 'UN';
+            }
+        }
+
+        loadAndDraw();
+    </script>
+</body>
+</html>
